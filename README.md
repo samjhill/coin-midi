@@ -1,8 +1,8 @@
 # coin-midi
 
-Controls MIDI devices based on cryptocurrency data from Coinbase!
+Controls MIDI devices based on live cryptocurrency trade data from Coinbase!
 
-Makes..."music".
+[Makes..."music".](https://www.youtube.com/watch?v=EI-a79RqOVg)
 
 
 ## Setup
