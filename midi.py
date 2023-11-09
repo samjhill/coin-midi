@@ -1,11 +1,6 @@
 import os
-import time
 import mido
-import requests
-from dotenv import load_dotenv
 import random
-import json
-import websocket
 
 
 # Define the musical scales
@@ -76,7 +71,7 @@ def bitcoin_to_midi_note(bitcoin_price, order_side="BUY", scale=selected_scale):
         note_index = int(bitcoin_normalized * note_range) + random_variation
     else:
         note_index = int(bitcoin_normalized * note_range) - random_variation
-        
+
     # Add the note index to the base note (C4)
     note = min_note + selected_scale_notes[note_index]
 
