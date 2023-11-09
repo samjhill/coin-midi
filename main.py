@@ -1,115 +1,132 @@
 import os
+import json
 import time
-import mido
-import requests
+import hmac
+import hashlib
+from threading import Thread
+from midi import bitcoin_to_midi_note, get_midi_output, send_note_to_midi_output
+from websocket import create_connection, WebSocketConnectionClosedException
 from dotenv import load_dotenv
-import random
+from datetime import datetime
+from collections import defaultdict
+from statistics import mean
 
 load_dotenv()
+midi_out = None
+maximum_amount = 0
 
-# Define your Coinbase Pro API credentials
-COINBASE_API_KEY = os.getenv("COINBASE_API_KEY")
-COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET")
+def main():
+    ws = None
+    
+    thread = None
+    thread_running = False
+    thread_keepalive = None
 
-# Define the MIDI port for output
-MIDI_PORT_NAME = os.getenv("MIDI_PORT_NAME")  # Use mido.get_output_names() to list available ports
+    midi_out = get_midi_output()
 
-# Initialize the MIDI output
-print("Available midi outputs:")
-for port in mido.get_output_names():
-    print(port)
+    def websocket_thread():
+        global ws
 
-default_midi_port = mido.get_output_names().pop()
-selected_midi_port = MIDI_PORT_NAME if MIDI_PORT_NAME else default_midi_port
-midi_output = mido.open_output(selected_midi_port)
-print(f"selected midi port: {selected_midi_port}")
+        api_key = os.getenv("COINBASE_API_KEY")
+        api_secret = os.getenv("COINBASE_API_SECRET")
 
-# Define the cryptocurrency pair to monitor
-CRYPTO_PAIR = os.getenv("CRYPTO_PAIR")
+        channel = "market_trades"
+        timestamp = str(int(time.time()))
+        product_ids = ["BTC-USD"]
+        product_ids_str = ",".join(product_ids)
+        message = f"{timestamp}{channel}{product_ids_str}"
+        signature = hmac.new(api_secret.encode("utf-8"), message.encode("utf-8"), digestmod=hashlib.sha256).hexdigest()
 
-# Define the musical scales
-scales = {
-    "C Major": [0, 2, 4, 5, 7, 9, 11],  # C, D, E, F, G, A, B
-    "C Natural Minor": [0, 2, 3, 5, 7, 8, 10],  # C, D, D#, F, G, G#, A#
-    "C# Major": [1, 3, 5, 6, 8, 10, 0],  # C#, D#, F, F#, G#, A#, C
-    "C# Natural Minor": [1, 3, 4, 6, 8, 9, 11],  # C#, D#, E, F#, G#, A, B
-    "D Major": [2, 4, 6, 7, 9, 11, 1],  # D, E, F#, G, A, B, C#
-    "D Natural Minor": [2, 4, 5, 7, 9, 10, 0],  # D, E, F, G, A, Bb, C
-    "D# Major": [3, 5, 7, 8, 10, 0, 2],  # D#, F, G, G#, A#, C, D
-    "D# Natural Minor": [3, 5, 6, 8, 10, 11, 1],  # D#, F, F#, G#, A#, B, C#
-    "E Major": [4, 6, 8, 9, 11, 1, 3],  # E, F#, G#, A, B, C#, D#
-    "E Natural Minor": [4, 6, 7, 9, 11, 0, 2],  # E, F#, G, A, B, C, D
-    "F Major": [5, 7, 9, 10, 0, 2, 4],  # F, G, A, A#, C, D, E
-    "F Natural Minor": [5, 7, 8, 10, 0, 1, 3],  # F, G, Ab, A#, C, Db, E
-    "F# Major": [6, 8, 10, 11, 1, 3, 5],  # F#, G#, A#, B, C#, D#, F
-    "F# Natural Minor": [6, 8, 9, 11, 1, 2, 4],  # F#, G#, A, B, C#, D, E
-    "G Major": [7, 9, 11, 0, 2, 4, 6],  # G, A, B, C, D, E, F#
-    "G Natural Minor": [7, 9, 10, 0, 2, 3, 5],  # G, A, Bb, C, D, Eb, F
-    "G# Major": [8, 10, 0, 1, 3, 5, 7],  # G#, A#, B, C#, D#, E#, G
-    "G# Natural Minor": [8, 10, 11, 1, 3, 4, 6],  # G#, A#, B, C#, D#, E, F#
-    "A Major": [9, 11, 1, 2, 4, 6, 8],  # A, B, C#, D, E, F#, G#
-    "A Natural Minor": [9, 11, 0, 2, 4, 5, 7],  # A, B, C, D, E, F, G
-    "A# Major": [10, 0, 2, 3, 5, 7, 9],  # A#, B, C#, D#, E#, F#, G#
-    "A# Natural Minor": [10, 0, 1, 3, 5, 6, 8],  # A#, B, C, D#, E#, F, G#
-    "B Major": [11, 1, 3, 4, 6, 8, 10],  # B, C#, D#, E, F#, G#, A#
-    "B Natural Minor": [11, 1, 2, 4, 6, 7, 9],  # B, C#, D, E, F#, G, A
-}
+        ws = create_connection("wss://advanced-trade-ws.coinbase.com")
+        ws.send(
+            json.dumps(
+                {
+                    "type": "subscribe",
+                    "product_ids": [
+                        "BTC-USD",
+                    ],
+                    "channel": channel,
+                    "api_key": api_key,
+                    "timestamp": timestamp,
+                    "signature": signature,
+                }
+            )
+        )
 
+        thread_keepalive.start()
 
-selected_scale = os.getenv("MUSICAL_SCALE", "C Major")  # Default to C Major
+        trade_buffer = defaultdict(list)
+        current_second = int(time.time())
+        
+        while not thread_running:
+            try:
+                data = ws.recv()
+                if data != "":
+                    msg = json.loads(data)
+                else:
+                    msg = {}
+            except ValueError as e:
+                print(e)
+                print("{} - data: {}".format(e, data))
+            except Exception as e:
+                print(e)
+                print("{} - data: {}".format(e, data))
+            else:
+                if "events" in msg:
+                    for event in msg["events"]:
+                        if "trades" in event:
+                            trades = event["trades"]
+                            for trade in trades:
+                                trade_time = datetime.fromisoformat(trade["time"])
+                                trade_second = trade_time.second
+                                trade_buffer[trade_second].append(trade)
+                                
+                                # Process trades for the previous second
+                                while current_second != trade_second:
+                                    process_trades(trade_buffer[current_second])
+                                    current_second = (current_second + 1) % 60
+                                    trade_buffer.pop(current_second, None)
+                        
+        try:
+            if ws:
+                ws.close()
+        except WebSocketConnectionClosedException:
+            pass
+        finally:
+            thread_keepalive.join()
 
-# Function to fetch real-time Bitcoin buy and sell data
-def get_realtime_bitcoin_data():
-    url = f'https://api.pro.coinbase.com/products/{CRYPTO_PAIR}/ticker'
-    response = requests.get(url)
-    data = response.json()
-    return data['price']
+    def websocket_keepalive(interval=30):
+        global ws
+        while ws.connected:
+            ws.ping("keepalive")
+            time.sleep(interval)
 
-# Function to convert Bitcoin price to MIDI note
-def bitcoin_to_midi_note(bitcoin_price, scale):
-    min_price = 10000  # Minimum Bitcoin price
-    max_price = 60000  # Maximum Bitcoin price
-    min_note = 60  # Lowest MIDI note (C4)
+    def process_trades(trades):
+        global maximum_amount
+        # Process trades in the 1-second interval here
+        if trades:
+            print("Trades in 1-second interval:", json.dumps(trades, indent=2))
+            average_price = mean(float(trade["price"]) for trade in trades)
+            amount = sum(float(trade["size"]) for trade in trades)
+            amount_of_buys = len(list(trade["side"] == "BUY" for trade in trades))
+            amount_of_sells = len(list(trade["side"] == "SELL" for trade in trades))
+            majority_side = "BUY" if amount_of_buys > amount_of_sells else "SELL"
 
-    # Define the selected scale
-    selected_scale_notes = scales[scale]
+            if amount > maximum_amount:
+                maximum_amount = amount
+            velocity = (amount / maximum_amount) * 100
+            midi_note = bitcoin_to_midi_note(average_price, majority_side)
+            send_note_to_midi_output(midi_note, midi_out, int(velocity))
 
-    # Calculate the range of notes within the selected scale
-    note_range = len(selected_scale_notes)
+    thread = Thread(target=websocket_thread)
+    thread_keepalive = Thread(target=websocket_keepalive)
+    thread.start()
 
-    # Scale the Bitcoin price to the note range
-    bitcoin_normalized = (bitcoin_price - min_price) / (max_price - min_price)
+    
 
-    # add some randomness for auditory niceness
-    random_variation = random.randrange(0, 2)
-
-    # Map the Bitcoin value to a note in the selected scale
-    note_index = int(bitcoin_normalized * note_range) + random_variation
-
-    # Add the note index to the base note (C4)
-    note = min_note + selected_scale_notes[note_index]
-
-    note = note + random_variation
-
-    print(f"note: {note}")
-    return note
-
-# Get the configurable BPM (beats per minute)
-BPM = int(os.getenv("BPM", 120))  # Default BPM is 120
-
-# Calculate the sleep duration based on BPM
-sleep_duration = 60 / BPM
-
-# Main loop for real-time Bitcoin to MIDI conversion
-while True:
+if __name__ == "__main__":
     try:
-        bitcoin_price = float(get_realtime_bitcoin_data())
-        midi_note = bitcoin_to_midi_note(bitcoin_price, selected_scale)
-        midi_output.send(mido.Message('note_on', note=midi_note, velocity=64))
-        time.sleep(sleep_duration)  # Adjust the frequency of MIDI updates as needed
-    except Exception as e:
-        print(f"Error: {e}")
-        time.sleep(60)  # Wait for a minute before retrying in case of an error
-
-# Close the MIDI port when done
-midi_output.close()
+        main()
+    except KeyboardInterrupt:
+        # Close the MIDI port when done
+        midi_out.close()
